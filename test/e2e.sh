@@ -12,6 +12,7 @@ set -u
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/dir-blocks-e2e.XXXXXX")
 export TERN_CONFIG_DIR="$tmp/cfg" TERN_DAEMON_SOCKET="$tmp/daemon.sock" XDG_STATE_HOME="$tmp/state"
+export STENCIL_LOG_DIR="$tmp/logs"
 mkdir -p "$TERN_CONFIG_DIR" "$XDG_STATE_HOME"
 ctl_sock="$tmp/ctl.sock"
 daemon_pid=""; win_pid=""
@@ -51,7 +52,7 @@ count() {
 	tern ls --json 2>/dev/null | jq --arg p "$1" --arg t "${2:-}" \
 		'[.sessions[].tabs[] | select($t == "" or (.number | tostring) == $t) | .blocks[] | select(.program == $p)] | length'
 }
-tern_windows() { hyprctl clients -j | jq '[.[] | select(.class == "so.stencil.tern")] | length'; }
+tern_windows() { hyprctl clients -j | jq --argjson pid "$win_pid" '[.[] | select(.class == "so.stencil.tern" and .pid == $pid)] | length'; }
 expect() { # name got want
 	if [ "$2" = "$3" ]; then echo "  ok   $1 ($2)"; else echo "  FAIL $1: got $2, want $3"; fails=$((fails + 1)); fi
 }
@@ -74,9 +75,11 @@ for p in "$root" "${plugins[@]}"; do
 	tern plugin link "$p" 2>&1 | grep -v stencil_trace | grep -v "^$" | tail -1
 done
 mkdir -p "$TERN_CONFIG_DIR/plugin-data/dir-blocks"
+top="" # extra top-level config.json keys, as `"key": value,`
 config_json() { # extra rules (a leading comma and JSON), appended after the main rule
 	cat <<EOF
 {
+  $top
   "rules": [
     { "path": "$rule_path",
       "blocks": [ { "block": "$rule_a", "place": "right"$ratio_a }, { "block": "$rule_b", "place": "down" } ] }$1
@@ -208,6 +211,34 @@ id_of() { tern ls --json | jq -r --argjson n "$stack_tab" --arg p "$1" '.session
 expect "the shell keeps the whole left side" "$(echo "$stack" | jq --argjson s "$stack_shell" '.Split.a.Leaf == $s')" true
 expect "$a is the top right" "$(echo "$stack" | jq --argjson i "$(id_of "$a")" '.Split.b.Split.a.Leaf == $i')" true
 expect "$b is below it on the right" "$(echo "$stack" | jq --argjson i "$(id_of "$b")" '.Split.b.Split.b.Leaf == $i')" true
+
+echo "== close_on_leave: leaving closes the blocks, coming back reopens them"
+top='"close_on_leave": true, "max_opens_per_minute": 60,'
+config_json ",
+    { \"path\": \"$work/repo2\", \"blocks\": [ { \"block\": \"$rule_b\", \"place\": \"tab\" } ] }" >"$TERN_CONFIG_DIR/plugin-data/dir-blocks/config.json"
+cd_to "$outside"
+ctl tab new >/dev/null; ctl ready >/dev/null; sleep 1
+close_tab=$(tern ls --json | jq '[.sessions[].tabs[]] | length')
+cd_to "$repo"
+expect "$a opened with close_on_leave on" "$(count "$a" "$close_tab")" 1
+expect "$b opened with close_on_leave on" "$(count "$b" "$close_tab")" 1
+cd_to "$repo/sub"
+expect "$a stays while inside the directory" "$(count "$a" "$close_tab")" 1
+expect "$b stays while inside the directory" "$(count "$b" "$close_tab")" 1
+cd_to "$outside"
+expect "$a closed after leaving" "$(count "$a" "$close_tab")" 0
+expect "$b closed after leaving" "$(count "$b" "$close_tab")" 0
+cd_to "$repo"
+expect "$a reopened on coming back" "$(count "$a" "$close_tab")" 1
+expect "$b reopened on coming back" "$(count "$b" "$close_tab")" 1
+tabs_before_tab=$(tern ls --json | jq '[.sessions[].tabs[]] | length')
+cd_to "$work/repo2"
+expect "moving into another rule closes the first rule's $a" "$(count "$a" "$close_tab")" 0
+expect "moving into another rule closes the first rule's $b" "$(count "$b" "$close_tab")" 0
+expect "the other rule opened its block in a new tab" "$(tern ls --json | jq '[.sessions[].tabs[]] | length')" "$((tabs_before_tab + 1))"
+cd_to "$outside"
+expect "leaving closes the block's tab" "$(tern ls --json | jq '[.sessions[].tabs[]] | length')" "$tabs_before_tab"
+top=""
 
 echo "== windows"
 expect "Tern windows (hyprctl clients) unchanged" "$(tern_windows)" "$windows_before"
