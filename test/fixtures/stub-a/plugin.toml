@@ -1,0 +1,10 @@
+schema = 1
+id = "stub-a"
+name = "stub-a"
+version = "0.0.0"
+description = "Test fixture: a block that shows its own name. Used by test/e2e.sh."
+host = "host.luau"
+
+[[blocks]]
+id = "panel"
+title = "stub-a"

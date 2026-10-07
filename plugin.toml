@@ -1,0 +1,8 @@
+schema = 1
+id = "dir-blocks"
+name = "dir-blocks"
+version = "0.1.0"
+description = "Open plugin blocks (jira, graphite, …) automatically when a pane enters a configured directory."
+icon = "folder"
+host = "host.luau"
+window = "window.luau"
