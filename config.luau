@@ -1,8 +1,6 @@
 --!strict
--- config.json: parsing, validation and path matching. Pure apart from `reader`
--- and `load_or_create`, which touch tern.fs / tern.json. Shared by both halves:
--- the host half validates at plugin load (so a bad config shows up in
--- `tern plugin list`), the window half applies the rules.
+-- config.json: parsing, validation and path matching. Pure apart from `reader`,
+-- which touches tern.fs and is first called from a window event, never at plugin load.
 local M = {}
 
 export type Place = "right" | "down" | "tab"
@@ -324,26 +322,22 @@ local function read(path: string): (string?, string?)
 	return text, nil
 end
 
---- Reads and validates `path`. A missing file gives the defaults without problems.
-function M.load(path: string, home: string?): Config
-	local text, err = read(path)
-	if err then
-		return failed(err, home)
-	end
-	if text == nil then
-		return M.parse({}, home)
-	end
-	return M.parse_text(text, home)
-end
-
---- A loader that re-reads the file on every call but only re-parses when its text changed.
+--- A loader for `path`. Nothing is read until it is first called (from the first `cwd` event or command), which
+--- also creates a default file when none exists. Every call re-reads the file (at most MAX_FILE_BYTES; `tern.fs`
+--- has no stat/mtime) but only re-parses when its text changed, so edits apply on the next call.
 function M.reader(path: string, home: string?): () -> Config
 	local cached_text: string? = nil
 	local cached: Config? = nil
+	local seeded = false
 	return function(): Config
 		local text, err = read(path)
 		if err then
 			return failed(err, home)
+		end
+		if text == nil and not seeded then
+			seeded = true
+			pcall(tern.fs.mkdir, (string.match(path, "^(.*)/[^/]*$")) or ".")
+			pcall(tern.fs.write, path, M.DEFAULT_TEXT)
 		end
 		if cached ~= nil and text == cached_text then
 			return cached
@@ -353,15 +347,6 @@ function M.reader(path: string, home: string?): () -> Config
 		cached = cfg
 		return cfg
 	end
-end
-
---- Host-half entry: validates, creating a default file on first run.
-function M.load_or_create(path: string, home: string?): Config
-	if not tern.fs.exists(path) then
-		pcall(tern.fs.mkdir, (string.match(path, "^(.*)/[^/]*$")) or ".")
-		pcall(tern.fs.write, path, M.DEFAULT_TEXT)
-	end
-	return M.load(path, home)
 end
 
 return M

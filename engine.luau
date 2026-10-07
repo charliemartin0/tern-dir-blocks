@@ -199,12 +199,6 @@ function Engine.problems(self: Engine): { string }
 	return out
 end
 
---- Reads the config once so problems are logged and shown in the status line. Never raises.
-function Engine.check_config(self: Engine)
-	load_config(self)
-	sync_enabled(self)
-end
-
 local function tab_state(self: Engine, tab: number): TabState
 	local state = self.tabs[tab]
 	if state == nil then
@@ -562,10 +556,11 @@ local function close_left(self: Engine, cx: WindowCx, pane_id: number, tab: numb
 end
 
 local function on_cwd(self: Engine, ev: CwdEvent, cx: WindowCx)
+	-- Read first, so config problems are logged and shown even while the auto-open switch is off.
+	local cfg = load_config(self)
 	if not sync_enabled(self) then
 		return
 	end
-	local cfg = load_config(self)
 	local dir = config.normalize(ev.path)
 	if dir == nil then
 		return
