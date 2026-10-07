@@ -34,7 +34,7 @@ Linking loads the plugin into the daemon and existing windows; no Tern restart i
 
 `config.json` lives in the plugin's data directory (Linux: `~/.local/state/tern/plugin-data/dir-blocks/config.json`, or `$TERN_CONFIG_DIR/plugin-data/dir-blocks/` when that is set). It is re-read on every directory change, so edits apply immediately. JSON has no comments, and the file must be a regular file: Tern refuses to read a symlink there, which then shows as a config problem.
 
-Example: `~/code/my-project` opens `jira` to the right and `graphite` below:
+Example: `~/code/my-project` opens `jira` on the right and `graphite` below it, also on the right:
 
 ```json
 {
@@ -46,7 +46,7 @@ Example: `~/code/my-project` opens `jira` to the right and `graphite` below:
       "path": "~/code/my-project",
       "blocks": [
         { "block": "jira", "place": "right" },
-        { "block": "graphite", "place": "down" }
+        { "block": "graphite", "place": "down", "of": "previous" }
       ]
     }
   ]
@@ -76,8 +76,9 @@ Example: `~/code/my-project` opens `jira` to the right and `graphite` below:
 | `block` | — | A plugin id (`"jira"`, which must have exactly one block) or a full block kind (`"jira.issues"`; use it when a plugin has several). |
 | `place` | `"right"` | `"right"` or `"down"`: split the pane that entered the directory. `"tab"`: a new tab in the same session and window. |
 | `ratio` | `0.5` | Share of the split the new block takes, 0.1–0.9. Ignored for `"tab"`. Tern's API moves dividers by whole cells, so the result is within about a cell of the ratio. |
+| `of` | `"shell"` | What to split. `"shell"`: the pane that entered the directory. `"previous"`: the block opened just before this one in the rule (or already open in the tab), which is how two blocks stack on one side. Not allowed on the first entry or with `"tab"`. If the previous block is missing, the shell is split instead and a warning is logged. |
 
-Entries open in order. Each splits the pane that entered the directory, so `jira` right then `graphite` down gives the shell the top left, `graphite` the bottom left and `jira` the right.
+Entries open in order. With the default `of`, each splits the shell, so `jira` right then `graphite` down gives the shell the top left, `graphite` the bottom left and `jira` the right. With the example above, `graphite` splits `jira` instead: the shell keeps the whole left side and `jira` sits on top of `graphite` on the right.
 
 ## How it listens
 

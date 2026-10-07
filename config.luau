@@ -6,7 +6,8 @@
 local M = {}
 
 export type Place = "right" | "down" | "tab"
-export type Entry = { block: string, place: Place, ratio: number }
+export type Of = "shell" | "previous"
+export type Entry = { block: string, place: Place, ratio: number, of: Of }
 export type Rule = { index: number, path: string, blocks: { Entry } }
 export type Config = {
 	auto_open: boolean,
@@ -37,7 +38,7 @@ M.DEFAULT_TEXT = [[{
 
 local TOP_KEYS = { auto_open = true, max_opens_per_minute = true, max_blocks_per_tab = true, rules = true }
 local RULE_KEYS = { path = true, blocks = true }
-local ENTRY_KEYS = { block = true, place = true, ratio = true }
+local ENTRY_KEYS = { block = true, place = true, ratio = true, of = true }
 
 --- Collapses `//`, `.` and `..` and drops a trailing slash. nil unless `path` is absolute.
 function M.normalize(path: string): string?
@@ -153,10 +154,23 @@ local function parse_entry(raw: any, label: string, problems: { string }): Entry
 			ratio = r
 		end
 	end
+	local of: Of = "shell"
+	if raw.of ~= nil then
+		if raw.of == "shell" or raw.of == "previous" then
+			of = raw.of
+		else
+			table.insert(problems, label .. ": `of` must be \"shell\" or \"previous\"")
+			ok = false
+		end
+	end
+	if of == "previous" and place == "tab" then
+		table.insert(problems, label .. ": `of` does not apply to `place` \"tab\"")
+		ok = false
+	end
 	if not ok then
 		return nil
 	end
-	return { block = block, place = place, ratio = ratio }
+	return { block = block, place = place, ratio = ratio, of = of }
 end
 
 local function parse_rule(raw: any, index: number, home: string?, problems: { string }): Rule?
@@ -200,6 +214,10 @@ local function parse_rule(raw: any, index: number, home: string?, problems: { st
 			break
 		end
 		local entry = parse_entry(item, label .. " blocks[" .. i .. "]", problems)
+		if entry and entry.of == "previous" and #blocks == 0 then
+			table.insert(problems, label .. " blocks[" .. i .. "]: `of` \"previous\" needs an earlier block in the rule")
+			entry = nil
+		end
 		if entry then
 			table.insert(blocks, entry)
 		end

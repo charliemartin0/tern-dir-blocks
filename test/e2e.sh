@@ -191,6 +191,24 @@ tern plugin reload >/dev/null 2>&1
 expect "plugin list is ready again after the config is fixed" \
 	"$(tern plugin list --json | jq -r '.plugins[] | select(.id == "dir-blocks") | .status | if type == "string" then . else "failed" end')" ready
 
+echo "== both blocks on the right (of: previous): the second block splits the first, not the shell"
+config_json ",
+    { \"path\": \"$work/stack\", \"blocks\": [ { \"block\": \"$rule_a\", \"place\": \"right\" }, { \"block\": \"$rule_b\", \"place\": \"down\", \"of\": \"previous\" } ] }" >"$TERN_CONFIG_DIR/plugin-data/dir-blocks/config.json"
+mkdir -p "$work/stack"
+cd_to "$outside"
+ctl tab new >/dev/null; ctl ready >/dev/null; sleep 1
+stack_tab=$(tern ls --json | jq '[.sessions[].tabs[]] | length')
+cd_to "$work/stack"
+expect "$a opened in the stack tab" "$(count "$a" "$stack_tab")" 1
+expect "$b opened in the stack tab" "$(count "$b" "$stack_tab")" 1
+stack=$(tern ls --json | jq -c --argjson n "$stack_tab" '.sessions[].tabs[] | select(.number == $n) | .splits')
+echo "  layout: $stack"
+stack_shell=$(tern ls --json | jq -r --argjson n "$stack_tab" '.sessions[].tabs[] | select(.number == $n) | .blocks[] | select(.program | test("sh$")) | .id')
+id_of() { tern ls --json | jq -r --argjson n "$stack_tab" --arg p "$1" '.sessions[].tabs[] | select(.number == $n) | .blocks[] | select(.program == $p) | .id'; }
+expect "the shell keeps the whole left side" "$(echo "$stack" | jq --argjson s "$stack_shell" '.Split.a.Leaf == $s')" true
+expect "$a is the top right" "$(echo "$stack" | jq --argjson i "$(id_of "$a")" '.Split.b.Split.a.Leaf == $i')" true
+expect "$b is below it on the right" "$(echo "$stack" | jq --argjson i "$(id_of "$b")" '.Split.b.Split.b.Leaf == $i')" true
+
 echo "== windows"
 expect "Tern windows (hyprctl clients) unchanged" "$(tern_windows)" "$windows_before"
 expect "windows on the private daemon unchanged" "$(tern inspect --json | jq '[.clients[] | select(.kind == "window")] | length')" "$clients_before"

@@ -247,13 +247,13 @@ local function resolve(cx: WindowCx, name: string): (string?, string?)
 	return nil, "no block `" .. name .. "`: is that plugin installed and ready on this host?"
 end
 
-local function visible_in_tab(cx: WindowCx, tab: number, kind: string): boolean
+local function pane_in_tab(cx: WindowCx, tab: number, kind: string): number?
 	for _, pane in cx.session:panes() do
 		if pane.tab == tab and pane.block == kind then
-			return true
+			return pane.pane
 		end
 	end
-	return false
+	return nil
 end
 
 -- The split node whose child leaf is `pane`.
@@ -390,18 +390,25 @@ local function apply(
 ): Outcome
 	local out: Outcome = { opened = {}, present = {}, failed = {}, limited = nil }
 	local state = tab_state(self, tab)
+	-- The pane of the previous entry's block, for `of = "previous"`.
+	local prev_pane: number? = nil
 	for _, entry in rule.blocks do
 		local key = rule.path .. "|" .. entry.block
 		if not manual and state.done[key] then
+			local done_kind = resolve(cx, entry.block)
+			prev_pane = if done_kind then pane_in_tab(cx, tab, done_kind) else nil
 			continue
 		end
 		local kind, why = resolve(cx, entry.block)
 		if kind == nil then
+			prev_pane = nil
 			set_problem(self, key, "rule " .. rule.path .. ": " .. tostring(why))
 			table.insert(out.failed, entry.block)
 			continue
 		end
-		if visible_in_tab(cx, tab, kind) then
+		local existing = pane_in_tab(cx, tab, kind)
+		if existing then
+			prev_pane = existing
 			state.done[key] = true
 			set_problem(self, key, nil)
 			table.insert(out.present, entry.block)
@@ -413,12 +420,23 @@ local function apply(
 			log_once(self, "warn", "tab " .. tab .. ": " .. limit .. "; not opening `" .. entry.block .. "`")
 			break
 		end
-		local id, err = open_block(self, cx, entry, kind, source, tab, dir)
+		local target = source
+		if entry.of == "previous" then
+			if prev_pane ~= nil and cx.session:tab_of(prev_pane) == tab then
+				target = prev_pane
+			else
+				log_once(self, "warn", "rule " .. rule.path .. ": the block before `" .. entry.block .. "` is not in the tab; splitting the shell instead")
+			end
+		end
+		local id, err = open_block(self, cx, entry, kind, target, tab, dir)
 		if id == nil then
+			prev_pane = nil
 			set_problem(self, key, "rule " .. rule.path .. ": could not open `" .. entry.block .. "`: " .. tostring(err))
 			table.insert(out.failed, entry.block)
 			continue
 		end
+		-- A tab placement returns a tab id, which is nothing to split.
+		prev_pane = if entry.place == "tab" then nil else id
 		set_problem(self, key, nil)
 		state.done[key] = true
 		state.opened += 1

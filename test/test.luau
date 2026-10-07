@@ -643,6 +643,68 @@ do
 	eq("blocks split the tiled shell, not the floating one", w.calls[1].target, 1)
 end
 
+-- 17. `of = "previous"` stacks blocks on one side
+do
+	local STACK = { rules = { { path = "/s", blocks = {
+		{ block = "jira", place = "right" },
+		{ block = "graphite", place = "down", of = "previous" },
+	} } } }
+	local w = shell_world()
+	local e = new_engine(STACK)
+	cwd(e, w, 1, "/s")
+	local jira_pane
+	for _, p in w.panes do
+		if p.block == "jira.issues" then
+			jira_pane = p.pane
+		end
+	end
+	eq("jira splits the shell", w.calls[1].target, 1)
+	eq("graphite splits jira, not the shell", w.calls[2].target, jira_pane)
+	eq("graphite goes down", w.calls[2].dir, "down")
+	local tree = w.trees[10]
+	check("the shell keeps the left, both blocks stack on the right",
+		tree.split == "right" and tree[1].pane == 1 and tree[2].split == "down", tree.split)
+
+	-- jira already in the tab: graphite stacks under that pane
+	local w2 = shell_world()
+	w2:add_pane({ pane = 9, tab = 10, kind = "plugin", block = "jira.issues" })
+	local e2 = new_engine(STACK)
+	cwd(e2, w2, 1, "/s")
+	eq("graphite stacks under a jira that was already open", w2.calls[1].target, 9)
+
+	-- jira cannot be opened: graphite falls back to the shell and says so
+	local w3 = new_world({ types = { "graphite.inbox" } })
+	w3:add_pane({ pane = 1, tab = 10, kind = "terminal" })
+	local e3, h3 = new_engine(STACK)
+	cwd(e3, w3, 1, "/s")
+	eq("graphite falls back to the shell when jira is missing", w3.calls[1].target, 1)
+	check("and logs why", string.find(joined(h3.logs.warn), "splitting the shell instead", 1, true) ~= nil)
+
+	-- a later cd after a partly-done rule still stacks on the right pane (jira done, graphite blocked by the limit)
+	local w4 = shell_world()
+	local e4, h4 = new_engine({ max_opens_per_minute = 1, rules = STACK.rules })
+	cwd(e4, w4, 1, "/s")
+	eq("rate limit stops after jira", #w4.calls, 1)
+	h4.clock.t = 61 * 1000
+	cwd(e4, w4, 1, "/s/x")
+	eq("graphite follows once the limit lifts", #w4.calls, 2)
+	eq("and still splits jira", w4.calls[2].target, w4.panes[#w4.panes - 1].pane)
+
+	-- validation
+	local bad = config.parse({ rules = {
+		{ path = "/a", blocks = { { block = "x", of = "previous" } } },
+		{ path = "/b", blocks = { "x", { block = "y", place = "tab", of = "previous" } } },
+		{ path = "/c", blocks = { "x", { block = "y", of = "left" } } },
+		{ path = "/d", blocks = { "x", { block = "y", place = "down", of = "previous" }, { block = "z", of = "shell" } } },
+	} }, HOME)
+	eq("first entry cannot be `of` previous", rules_of(bad), "/b,/c,/d")
+	eq("`of` with a tab is rejected", #bad.rules[1].blocks, 1)
+	eq("unknown `of` is rejected", #bad.rules[2].blocks, 1)
+	eq("valid `of` entries are kept", #bad.rules[3].blocks, 3)
+	eq("`of` parsed", bad.rules[3].blocks[2].of, "previous")
+	eq("`of` defaults to the shell", bad.rules[3].blocks[1].of, "shell")
+end
+
 if failures > 0 then
 	print(("%d of %d checks FAILED"):format(failures, count))
 	error("tests failed", 0)
