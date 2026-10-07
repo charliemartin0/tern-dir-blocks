@@ -6,11 +6,12 @@
 --
 -- Invariants:
 --   * only blocks listed by the single most specific matching rule are opened;
---   * each (tab, rule, block) is opened at most once per window session, and
---     never when that block is already in the tab;
+--   * each (tab, rule, block) is opened at most once until close_on_leave forgets it,
+--     and never when that block is already in the tab;
 --   * at most `max_blocks_per_tab` opens per tab and `max_opens_per_minute`
---     auto opens per window, however many events arrive;
---   * only layout:split / layout:new_tab are used: no new windows;
+--     auto opens per window, however many events arrive (closing a block gives its slot back to the tab);
+--   * only layout:split / layout:new_tab (open) and layout:close (close_on_leave, off by default) are
+--     used: no new windows, and only blocks this plugin opened are ever closed;
 --   * nothing here raises into Tern: every entry point is pcall'd.
 local config = require("./config")
 
@@ -28,7 +29,16 @@ export type Deps = {
 	changed: () -> (),
 }
 
-type TabState = { done: { [string]: boolean }, opened: number }
+-- A completed entry. A pane id means this plugin owns the block; nil only resets the
+-- already-present entry's completion on leave, never closing someone else's block.
+type Owned = { pane: number?, kind: string, key: string }
+
+type TabState = {
+	done: { [string]: boolean },
+	opened: number,
+	-- Completed entries by rule path, in opening order. Only filled while `close_on_leave` is on.
+	owned: { [string]: { Owned } },
+}
 
 type Fields = {
 	deps: Deps,
@@ -198,7 +208,7 @@ end
 local function tab_state(self: Engine, tab: number): TabState
 	local state = self.tabs[tab]
 	if state == nil then
-		state = { done = {}, opened = 0 }
+		state = { done = {}, opened = 0, owned = {} }
 		self.tabs[tab] = state
 	end
 	return state
@@ -333,7 +343,7 @@ local function allow(self: Engine, cfg: config.Config, tab: number, manual: bool
 	return nil
 end
 
--- Opens one block; returns its pane (or tab) id, nil + reason on failure.
+-- Opens one block; both split and new_tab return the new pane id, nil + reason on failure.
 local function open_block(
 	self: Engine,
 	cx: WindowCx,
@@ -376,6 +386,12 @@ local function open_block(
 	return pane, nil
 end
 
+local function remember(state: TabState, path: string, owned: Owned)
+	local list = state.owned[path] or {}
+	state.owned[path] = list
+	table.insert(list, owned)
+end
+
 -- Opens the rule's blocks that are not done / visible yet, in order. `manual` skips the once-per-tab
 -- memory and the rate limit (not the per-tab cap).
 local function apply(
@@ -409,6 +425,9 @@ local function apply(
 		local existing = pane_in_tab(cx, tab, kind)
 		if existing then
 			prev_pane = existing
+			if cfg.close_on_leave and not state.done[key] then
+				remember(state, rule.path, { pane = nil, kind = kind, key = key })
+			end
 			state.done[key] = true
 			set_problem(self, key, nil)
 			table.insert(out.present, entry.block)
@@ -435,11 +454,14 @@ local function apply(
 			table.insert(out.failed, entry.block)
 			continue
 		end
-		-- A tab placement returns a tab id, which is nothing to split.
+		-- A tab placement's pane is outside the source tab, so later entries cannot split it.
 		prev_pane = if entry.place == "tab" then nil else id
 		set_problem(self, key, nil)
 		state.done[key] = true
 		state.opened += 1
+		if cfg.close_on_leave then
+			remember(state, rule.path, { pane = id, kind = kind, key = key })
+		end
 		table.insert(self.recent, self.deps.now())
 		table.insert(out.opened, entry.block)
 		self.deps.log.info("dir-blocks: opened " .. kind .. " " .. entry.place .. " in tab " .. tab .. " for " .. rule.path)
@@ -460,33 +482,112 @@ local function all_done(self: Engine, rule: config.Rule, tab: number): boolean
 	return true
 end
 
+-- Whether `pane` reacts to rules: a tiled terminal or agent on this machine. Blocks (including the ones
+-- this plugin opens) and floating panes never do.
+local function is_trigger(cx: WindowCx, pane: PaneInfo): boolean
+	return is_shell(pane) and pane.floating ~= true and is_local(cx, pane.pane)
+end
+
+-- Whether a shell of `tab` other than `except` is still in `path` or below it.
+local function shell_remains(cx: WindowCx, tab: number, except: number, path: string): boolean
+	for _, pane in cx.session:panes() do
+		if pane.tab == tab and pane.pane ~= except and is_trigger(cx, pane) then
+			local dir = config.normalize(pane.cwd or "")
+			if dir ~= nil and config.contains(path, dir) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+-- Closes what the rule at `path` opened in this tab and forgets it, so entering the directory again opens
+-- it again. A block the user already closed is just forgotten.
+local function close_owned(self: Engine, cx: WindowCx, state: TabState, path: string)
+	local list = state.owned[path]
+	if list == nil then
+		return
+	end
+	for i = #list, 1, -1 do
+		local owned = list[i]
+		local pane = owned.pane
+		local info = if pane then cx.session:pane(pane) else nil
+		if pane ~= nil and info ~= nil and info.block == owned.kind then
+			local err = try(function()
+				cx.layout:close(pane)
+			end)
+			if err then
+				log_once(self, "warn", "could not close `" .. owned.kind .. "`: " .. err)
+				-- Still owned and counted: a failed close must not turn it into an untracked block.
+				continue
+			else
+				self.deps.log.info("dir-blocks: closed " .. owned.kind .. " after leaving " .. path)
+			end
+		end
+		state.done[owned.key] = nil
+		if pane ~= nil then
+			state.opened = math.max(0, state.opened - 1)
+		end
+		table.remove(list, i)
+	end
+	if #list == 0 then
+		state.owned[path] = nil
+	end
+end
+
+-- A pane of `tab` moved to `dir`: closes the blocks of every rule whose directory it is no longer in, unless
+-- another shell of the tab is still there. Moving into a deeper rule's directory leaves the outer rule's
+-- blocks open, since the pane is still inside the outer directory.
+local function close_left(self: Engine, cx: WindowCx, pane_id: number, tab: number, dir: string)
+	local state = self.tabs[tab]
+	if state == nil or next(state.owned) == nil then
+		return
+	end
+	local pane = cx.session:pane(pane_id)
+	if pane == nil or not is_trigger(cx, pane) then
+		return
+	end
+	local paths: { string } = {}
+	for path in state.owned do
+		if not config.contains(path, dir) then
+			table.insert(paths, path)
+		end
+	end
+	table.sort(paths)
+	for _, path in paths do
+		if not shell_remains(cx, tab, pane_id, path) then
+			close_owned(self, cx, state, path)
+		end
+	end
+end
+
 local function on_cwd(self: Engine, ev: CwdEvent, cx: WindowCx)
 	if not sync_enabled(self) then
 		return
 	end
 	local cfg = load_config(self)
-	if #cfg.rules == 0 then
-		return
-	end
 	local dir = config.normalize(ev.path)
 	if dir == nil then
 		return
 	end
 	local rule = config.best(cfg.rules, dir)
-	if rule == nil then
+	if rule == nil and not cfg.close_on_leave then
 		return
 	end
 	local tab = cx.session:tab_of(ev.pane)
-	if tab == nil or all_done(self, rule, tab) then
+	if tab == nil then
+		return
+	end
+	if cfg.close_on_leave then
+		close_left(self, cx, ev.pane, tab, dir)
+	end
+	if rule == nil or all_done(self, rule, tab) then
 		return
 	end
 	-- Only shells react: blocks this plugin opens (and any other block) never trigger more opens.
-	local pane = cx.session:pane(ev.pane)
-	if pane == nil or not is_shell(pane) or pane.floating == true then
-		return
-	end
 	-- `~` and the rule paths are this machine's; another host's panes have their own filesystem.
-	if not is_local(cx, ev.pane) then
+	local pane = cx.session:pane(ev.pane)
+	if pane == nil or not is_trigger(cx, pane) then
 		return
 	end
 	apply(self, cx, cfg, rule, ev.pane, tab, dir, false)

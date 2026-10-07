@@ -11,6 +11,7 @@ export type Entry = { block: string, place: Place, ratio: number, of: Of }
 export type Rule = { index: number, path: string, blocks: { Entry } }
 export type Config = {
 	auto_open: boolean,
+	close_on_leave: boolean,
 	max_opens_per_minute: number,
 	max_blocks_per_tab: number,
 	rules: { Rule },
@@ -30,13 +31,15 @@ local DEFAULT_BLOCKS_PER_TAB = 8
 
 M.DEFAULT_TEXT = [[{
   "auto_open": true,
+  "close_on_leave": false,
   "max_opens_per_minute": 6,
   "max_blocks_per_tab": 8,
   "rules": []
 }
 ]]
 
-local TOP_KEYS = { auto_open = true, max_opens_per_minute = true, max_blocks_per_tab = true, rules = true }
+local TOP_KEYS =
+	{ auto_open = true, close_on_leave = true, max_opens_per_minute = true, max_blocks_per_tab = true, rules = true }
 local RULE_KEYS = { path = true, blocks = true }
 local ENTRY_KEYS = { block = true, place = true, ratio = true, of = true }
 
@@ -233,6 +236,7 @@ function M.parse(data: any, home: string?): Config
 	local problems: { string } = {}
 	local cfg: Config = {
 		auto_open = true,
+		close_on_leave = false,
 		max_opens_per_minute = DEFAULT_OPENS_PER_MINUTE,
 		max_blocks_per_tab = DEFAULT_BLOCKS_PER_TAB,
 		rules = {},
@@ -252,6 +256,13 @@ function M.parse(data: any, home: string?): Config
 			cfg.auto_open = data.auto_open
 		else
 			table.insert(problems, "`auto_open` must be true or false")
+		end
+	end
+	if data.close_on_leave ~= nil then
+		if type(data.close_on_leave) == "boolean" then
+			cfg.close_on_leave = data.close_on_leave
+		else
+			table.insert(problems, "`close_on_leave` must be true or false")
 		end
 	end
 	cfg.max_opens_per_minute =

@@ -143,6 +143,7 @@ local function new_world(opts)
 		hosts = { { kind = "local", name = "here", panes = {} } },
 		types = opts.types or { "jira.issues", "graphite.inbox" },
 		calls = {}, -- split / new_tab records
+		closed = {}, -- pane ids passed to close
 		toasts = {},
 		next_pane = 100,
 		next_tab = 50,
@@ -237,7 +238,25 @@ local function new_world(opts)
 			w.next_tab += 1
 			w.next_pane += 1
 			w:add_pane({ pane = w.next_pane, tab = w.next_tab, kind = "plugin", block = launch.block, cwd = launch.cwd or "" })
-			return w.next_tab
+			return w.next_pane
+		end,
+		close = function(_, pane)
+			table.insert(w.closed, pane)
+			for i, p in w.panes do
+				if p.pane == pane then
+					table.remove(w.panes, i)
+					break
+				end
+			end
+			for _, tree in w.trees do
+				local _leaf, parent = find_leaf(tree, pane)
+				if parent then
+					-- the sibling takes the closed leaf's place
+					local sibling = if parent[1].pane == pane then parent[2] else parent[1]
+					parent[1], parent[2], parent.split, parent.ratio = sibling[1], sibling[2], sibling.split, sibling.ratio
+					parent.pane = sibling.pane
+				end
+			end
 		end,
 		resize = function(_, pane, dir, cells)
 			-- 100 cells across: moving the divider toward the first child by n cells lowers its ratio by n/100
@@ -703,6 +722,294 @@ do
 	eq("valid `of` entries are kept", #bad.rules[3].blocks, 3)
 	eq("`of` parsed", bad.rules[3].blocks[2].of, "previous")
 	eq("`of` defaults to the shell", bad.rules[3].blocks[1].of, "shell")
+end
+
+----------------------------------------------------------------------------------------------------
+-- close_on_leave
+----------------------------------------------------------------------------------------------------
+do
+	local badflag = config.parse({ close_on_leave = "yes" }, HOME)
+	eq("close_on_leave must be a boolean", #badflag.problems, 1)
+	eq("a bad close_on_leave falls back to false", badflag.close_on_leave, false)
+
+	local function with(extra)
+		local t = { close_on_leave = true, max_opens_per_minute = 60 }
+		for k, v in extra or {} do
+			t[k] = v
+		end
+		t.rules = t.rules or PERSONAL.rules
+		return t
+	end
+	local function plugin_panes(w)
+		local n = 0
+		for _, p in w.panes do
+			if p.block then
+				n += 1
+			end
+		end
+		return n
+	end
+
+	-- off by default: leaving closes nothing
+	do
+		local w = shell_world()
+		local e = new_engine(PERSONAL)
+		cwd(e, w, 1, REPO)
+		cwd(e, w, 1, HOME)
+		eq("off: leaving closes nothing", #w.closed, 0)
+		eq("off: the blocks stay", plugin_panes(w), 2)
+	end
+
+	-- on: leave closes, cd around does not, re-enter reopens
+	do
+		local w = shell_world()
+		local e = new_engine(with())
+		cwd(e, w, 1, REPO)
+		eq("on: entering opens both", plugin_panes(w), 2)
+		cwd(e, w, 1, REPO .. "/src")
+		cwd(e, w, 1, REPO)
+		eq("on: cd around inside closes nothing", #w.closed, 0)
+		cwd(e, w, 1, HOME)
+		eq("on: leaving closes both", #w.closed, 2)
+		eq("on: only the shell is left", plugin_panes(w), 0)
+		cwd(e, w, 1, HOME .. "/elsewhere")
+		eq("on: moving on outside closes nothing more", #w.closed, 2)
+		cwd(e, w, 1, REPO)
+		eq("on: re-entering opens them again", plugin_panes(w), 2)
+		cwd(e, w, 1, HOME)
+		eq("on: and they close again", plugin_panes(w), 0)
+		eq("on: no problems", #e:problems(), 0)
+	end
+
+	-- the per-tab cap counts blocks that are open, so open/close cycles do not exhaust it
+	do
+		local w = shell_world()
+		local e = new_engine(with({ max_blocks_per_tab = 2 }))
+		for _ = 1, 4 do
+			cwd(e, w, 1, REPO)
+			cwd(e, w, 1, HOME)
+		end
+		eq("cap: every cycle opened both blocks", #w.calls, 8)
+		cwd(e, w, 1, REPO)
+		eq("cap: still opens after many cycles", plugin_panes(w), 2)
+	end
+
+	-- a second shell in the directory keeps the blocks until it leaves too
+	do
+		local w = shell_world()
+		w:add_pane({ pane = 2, tab = 10, kind = "terminal", cwd = REPO })
+		local e = new_engine(with())
+		cwd(e, w, 1, REPO)
+		eq("two shells: opened once", plugin_panes(w), 2)
+		w.panes[1].cwd = HOME
+		cwd(e, w, 1, HOME)
+		eq("two shells: one leaving closes nothing", #w.closed, 0)
+		w.panes[2].cwd = HOME
+		cwd(e, w, 2, HOME)
+		eq("two shells: the last one leaving closes both", #w.closed, 2)
+	end
+
+	-- a shell elsewhere moving around does not close blocks another shell keeps
+	do
+		local w = shell_world()
+		w:add_pane({ pane = 2, tab = 10, kind = "terminal", cwd = HOME })
+		local e = new_engine(with())
+		w.panes[1].cwd = REPO
+		cwd(e, w, 1, REPO)
+		w.panes[2].cwd = HOME .. "/x"
+		cwd(e, w, 2, HOME .. "/x")
+		eq("bystander shell: nothing closes", #w.closed, 0)
+	end
+
+	-- other tabs are unaffected
+	do
+		local w = shell_world()
+		w:add_pane({ pane = 2, tab = 11, kind = "terminal", cwd = HOME })
+		local e = new_engine(with())
+		cwd(e, w, 1, REPO)
+		cwd(e, w, 2, HOME .. "/x")
+		eq("other tab moving closes nothing here", #w.closed, 0)
+		eq("blocks of the first tab stay", plugin_panes(w), 2)
+	end
+
+	-- nested rules: leaving the inner one closes only its blocks, and the outer rule's stay
+	do
+		local rules = {
+			{ path = "~/code/my-project", blocks = { "jira" } },
+			{ path = "~/code/my-project/api", blocks = { "graphite" } },
+		}
+		local w = shell_world()
+		local e = new_engine(with({ rules = rules }))
+		cwd(e, w, 1, REPO)
+		cwd(e, w, 1, REPO .. "/api")
+		eq("nested: both rules opened their block", plugin_panes(w), 2)
+		cwd(e, w, 1, REPO)
+		eq("nested: leaving the inner rule closes its block", #w.closed, 1)
+		local left = {}
+		for _, p in w.panes do
+			if p.block then
+				table.insert(left, p.block)
+			end
+		end
+		eq("nested: the outer rule's block stays", joined(left), "jira.issues")
+		cwd(e, w, 1, REPO .. "/api")
+		eq("nested: re-entering the inner rule reopens its block", plugin_panes(w), 2)
+		cwd(e, w, 1, HOME)
+		eq("nested: leaving both closes both", plugin_panes(w), 0)
+	end
+
+	-- Shared kinds still reopen when the owning outer rule closed the block.
+	do
+		local rules = {
+			{ path = REPO, blocks = { "jira" } },
+			{ path = REPO .. "/api", blocks = { "jira" } },
+		}
+		local w = shell_world()
+		local e = new_engine(with({ rules = rules }))
+		cwd(e, w, 1, REPO)
+		cwd(e, w, 1, REPO .. "/api")
+		eq("shared kind: inner rule does not duplicate it", plugin_panes(w), 1)
+		cwd(e, w, 1, HOME)
+		eq("shared kind: leaving closes the owned block", plugin_panes(w), 0)
+		cwd(e, w, 1, REPO .. "/api")
+		eq("shared kind: direct inner re-entry reopens it", plugin_panes(w), 1)
+		cwd(e, w, 1, HOME)
+		eq("shared kind: the reopened block is also owned", plugin_panes(w), 0)
+	end
+
+	-- Closing does not refund the window's rate limit.
+	do
+		local w = shell_world()
+		local e, h = new_engine(with({
+			max_opens_per_minute = 1,
+			rules = { { path = REPO, blocks = { "jira" } } },
+		}))
+		cwd(e, w, 1, REPO)
+		cwd(e, w, 1, HOME)
+		cwd(e, w, 1, REPO)
+		eq("rate limit: re-entry before expiry stays closed", plugin_panes(w), 0)
+		h.clock.t = 60000
+		cwd(e, w, 1, REPO .. "/src")
+		eq("rate limit: next cd at expiry reopens it", plugin_panes(w), 1)
+	end
+
+	-- moving from one rule straight into another closes the first one's blocks and opens the second's
+	do
+		local rules = {
+			{ path = "/r/a", blocks = { "jira" } },
+			{ path = "/r/b", blocks = { "graphite" } },
+		}
+		local w = shell_world()
+		local e = new_engine(with({ rules = rules }))
+		cwd(e, w, 1, "/r/a")
+		cwd(e, w, 1, "/r/b")
+		local left = {}
+		for _, p in w.panes do
+			if p.block then
+				table.insert(left, p.block)
+			end
+		end
+		eq("a to b: a's block closed, b's open", joined(left), "graphite.inbox")
+	end
+
+	-- only what the plugin opened is closed
+	do
+		local w = shell_world()
+		w:add_pane({ pane = 5, tab = 10, kind = "plugin", block = "jira.issues", cwd = "" })
+		local e = new_engine(with())
+		cwd(e, w, 1, REPO)
+		eq("preexisting: only graphite opened", opened(w), "down:graphite.inbox")
+		cwd(e, w, 1, HOME)
+		eq("preexisting: the block that was already there stays", plugin_panes(w), 1)
+		eq("preexisting: only the opened one closed", #w.closed, 1)
+	end
+
+	-- a block the user closed meanwhile is forgotten without a close call or a problem
+	do
+		local w = shell_world()
+		local e = new_engine(with())
+		cwd(e, w, 1, REPO)
+		w.cx.layout:close(w.panes[2].pane)
+		local before = #w.closed
+		cwd(e, w, 1, HOME)
+		eq("user-closed: only the remaining block is closed", #w.closed - before, 1)
+		cwd(e, w, 1, REPO)
+		eq("user-closed: re-entering brings both back", plugin_panes(w), 2)
+	end
+
+	-- a pane id that now shows something else is left alone
+	do
+		local w = shell_world()
+		local e = new_engine(with())
+		cwd(e, w, 1, REPO)
+		w.panes[2].block = "other.thing"
+		cwd(e, w, 1, HOME)
+		eq("reused id: only the real block closed", #w.closed, 1)
+	end
+
+	-- tab placement: the tab's block is closed
+	do
+		local rules = { { path = "~/code/my-project", blocks = { { block = "jira", place = "tab" } } } }
+		local w = shell_world()
+		local e = new_engine(with({ rules = rules }))
+		cwd(e, w, 1, REPO)
+		eq("tab: opened in a new tab", opened(w), "new_tab:jira.issues")
+		local block_pane = w.panes[2].pane
+		cwd(e, w, 1, HOME)
+		eq("tab: its pane is closed on leaving", w.closed[1], block_pane)
+		cwd(e, w, 1, REPO)
+		eq("tab: re-entering opens it again", #w.calls, 2)
+	end
+
+	-- a block's own directory changes, a floating shell and an auto-open switch that is off do not close anything
+	do
+		local w = shell_world()
+		local e = new_engine(with())
+		cwd(e, w, 1, REPO)
+		cwd(e, w, w.panes[2].pane, HOME)
+		eq("a block changing directory closes nothing", #w.closed, 0)
+		w:add_pane({ pane = 7, tab = 10, kind = "terminal", floating = true, cwd = HOME })
+		cwd(e, w, 7, HOME)
+		eq("a floating shell does not close anything", #w.closed, 0)
+	end
+	do
+		local w = shell_world()
+		local e, h = new_engine(with())
+		cwd(e, w, 1, REPO)
+		h.store.auto_open = false
+		cwd(e, w, 1, HOME)
+		eq("auto-open off: leaving closes nothing", #w.closed, 0)
+	end
+
+	-- turning the option off stops closing
+	do
+		local w = shell_world()
+		local e, h = new_engine(with())
+		cwd(e, w, 1, REPO)
+		h.set(PERSONAL)
+		cwd(e, w, 1, HOME)
+		eq("option switched off in config.json: nothing closes", #w.closed, 0)
+	end
+
+	-- a failing close is logged, not raised, and the rest still close
+	do
+		local w = shell_world()
+		local e = new_engine(with())
+		cwd(e, w, 1, REPO)
+		local real = w.cx.layout.close
+		local calls = 0
+		w.cx.layout.close = function(self, pane)
+			calls += 1
+			if calls == 1 then
+				error("boom")
+			end
+			real(self, pane)
+		end
+		cwd(e, w, 1, HOME)
+		eq("failing close: the other block still closes", plugin_panes(w), 1)
+		cwd(e, w, 1, HOME .. "/elsewhere")
+		eq("failing close: still owned on the next directory event", plugin_panes(w), 0)
+	end
 end
 
 if failures > 0 then
