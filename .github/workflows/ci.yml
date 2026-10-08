@@ -34,7 +34,7 @@ jobs:
           echo "$luau_dir" >> "$GITHUB_PATH"
 
       - name: Compile modules
-        run: luau-compile --null config.luau engine.luau host.luau window.luau
+        run: luau-compile --null config.luau engine.luau window.luau
 
       - name: Run unit tests
         run: luau test/test.luau

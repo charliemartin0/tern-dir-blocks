@@ -20,7 +20,7 @@ cd tern-dir-blocks
 tern plugin link .
 ```
 
-Linking loads the plugin into the daemon and existing windows; no Tern restart is needed. On first load the plugin writes a default `config.json` with no rules (see [Config](#config)). Run `tern plugin types .` to regenerate `tern.d.luau` after a Tern SDK update.
+Linking loads the plugin into the daemon and existing windows; no Tern restart is needed. The plugin has no host half and does nothing at load beyond registering its event, commands and status segment. The first directory change (or command) in a window reads `config.json`, writing a default one with no rules if there is none (see [Config](#config)). Run `tern plugin types .` to regenerate `tern.d.luau` after a Tern SDK update.
 
 ## What it does
 
@@ -33,7 +33,7 @@ Linking loads the plugin into the daemon and existing windows; no Tern restart i
 
 ## Config
 
-`config.json` lives in the plugin's data directory (Linux: `~/.local/state/tern/plugin-data/dir-blocks/config.json`, or `$TERN_CONFIG_DIR/plugin-data/dir-blocks/` when that is set). It is re-read on every directory change, so edits apply immediately. JSON has no comments, and the file must be a regular file: Tern refuses to read a symlink there, which then shows as a config problem.
+`config.json` lives in the plugin's data directory (Linux: `~/.local/state/tern/plugin-data/dir-blocks/config.json`, or `$TERN_CONFIG_DIR/plugin-data/dir-blocks/` when that is set). It is first read on a window's first directory change, then re-read on every directory change, so edits apply immediately. `tern.fs` has no mtime, so the parsed config is cached against the file's text and only re-parsed when that changes. JSON has no comments, and the file must be a regular file: Tern refuses to read a symlink there, which then shows as a config problem.
 
 Example: `~/code/my-project` opens `jira` on the right and `graphite` below it, also on the right:
 
@@ -105,8 +105,7 @@ The `cwd` event fires when the shell reports a new directory, once per `cd` (als
 - **Only configured blocks**: only the winning rule's blocks, each at most once per tab until optional close-on-leave forgets them. A block already in the tab is skipped. Blocks the plugin opened never trigger more opens (only shells do), so a `tab` rule cannot chain.
 - **Limits**: `max_opens_per_minute` (auto only) and `max_blocks_per_tab` (auto and manual).
 - **Bad config or a missing plugin never breaks anything**: a bad rule or entry is skipped and the rest keep working; an unknown, ambiguous or failing block is skipped and logged once. Every entry point is wrapped so no error reaches Tern.
-- **Problems are visible** in three places:
-  - **`tern plugin list`** and `tern plugin reload` (exit status 1): the plugin's host half validates `config.json` when it loads and fails with the first problems, e.g. ``failed: runtime error: dir-blocks config problem: rules[3] (relative/path): `path` must be absolute or start with `~/` ``. Tern only reports a plugin's load failure there, so this is the one route into that list. The window half is separate and unaffected: it keeps applying the valid rules. The list reflects the config as of the last load or reload; run `tern plugin reload` after editing.
+- **Problems are visible** in two places, once a window has read `config.json` (its first directory change or command; `tern plugin list` does not report config problems, because the plugin does no config work at load):
   - **The Tern log** (`STENCIL_LOG=warn,tern::plugin=info`): each distinct problem once, prefixed `dir-blocks:`, plus one `info` line per block opened.
   - **The status line and the status command**, live: config problems and runtime ones (plugin not installed or ambiguous, a split that Tern refused).
 
@@ -124,7 +123,7 @@ The `cwd` event fires when the shell reports a new directory, once per `cd` (als
 Unit tests run the real `config.luau` and `engine.luau` against a fake window (no Tern needed) with the [Luau CLI](https://github.com/luau-lang/luau/releases):
 
 ```sh
-luau-compile --null config.luau engine.luau host.luau window.luau
+luau-compile --null config.luau engine.luau window.luau
 luau test/test.luau
 ```
 
@@ -140,7 +139,7 @@ Type-check with [luau-lsp](https://github.com/JohnnyMorganz/luau-lsp) against th
 
 ```sh
 echo 'declare extern type userdata with end' > /tmp/userdata.d.luau
-luau-lsp analyze --definitions=/tmp/userdata.d.luau --definitions=$PWD/tern.d.luau config.luau engine.luau host.luau window.luau
+luau-lsp analyze --definitions=/tmp/userdata.d.luau --definitions=$PWD/tern.d.luau config.luau engine.luau window.luau
 ```
 
 The screenshot is captured from a private window with `tern ctl --control <socket> shot blocks`, floated and sized to 1536×864 logical pixels at scale 1.25 (1920×1080), not with a desktop grab. It shows the two fixture blocks in `test/fixtures` (`stub-a`, `stub-b`), never live Jira or Graphite data.

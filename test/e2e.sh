@@ -75,7 +75,7 @@ for p in "$root" "${plugins[@]}"; do
 	tern plugin link "$p" 2>&1 | grep -v stencil_trace | grep -v "^$" | tail -1
 done
 mkdir -p "$TERN_CONFIG_DIR/plugin-data/dir-blocks"
-top="" # extra top-level config.json keys, as `"key": value,`
+top='"max_opens_per_minute": 60,' # extra top-level config.json keys, as `"key": value,`; the plugin is no longer reloaded between sections, so keep the rate limit out of the way
 config_json() { # extra rules (a leading comma and JSON), appended after the main rule
 	cat <<EOF
 {
@@ -163,16 +163,11 @@ expect "$a opened in the new tab with auto-open on" "$(count "$a" 2)" 1
 expect "$b opened in the new tab with auto-open on" "$(count "$b" 2)" 1
 expect "$a total across tabs" "$(count "$a")" 2
 
-echo "== a config with bad rules: plugin list reports it, the valid rules still work"
+echo "== a config with bad rules: the first cwd event logs them, the plugin stays ready, the valid rules still work"
 config_json ",
     { \"path\": \"$work/repo2\", \"blocks\": [ { \"block\": \"$rule_a\", \"place\": \"tab\" } ] },
     { \"path\": \"relative/path\", \"blocks\": [ \"$rule_a\" ] },
     { \"path\": \"$work/ghost\", \"blocks\": [ \"no-such-plugin\" ] }" >"$TERN_CONFIG_DIR/plugin-data/dir-blocks/config.json"
-if tern plugin reload >"$tmp/reload.out" 2>&1; then reload_rc=0; else reload_rc=$?; fi
-expect "tern plugin reload exits 1" "$reload_rc" 1
-listed=$(tern plugin list 2>/dev/null | grep "^dir-blocks")
-echo "  $listed"
-expect "tern plugin list shows failed with the bad rule" "$(echo "$listed" | grep -c 'failed:.*rules\[3\] (relative/path)')" 1
 # a fresh tab that starts outside every rule (new tabs start in the directory of the pane they were
 # opened from); the block the rule opens must not already be in the tab it is triggered from
 cd_to "$outside"
@@ -189,10 +184,11 @@ expect "the new tab did not take focus from the tab being used" "$(tern ls --jso
 cd_to "$work/repo2/.."
 cd_to "$work/repo2"
 expect "re-entering does not open another tab" "$(tern ls --json | jq '[.sessions[].tabs[]] | length')" "$((tabs_before + 1))"
-config_json "" >"$TERN_CONFIG_DIR/plugin-data/dir-blocks/config.json"
-tern plugin reload >/dev/null 2>&1
-expect "plugin list is ready again after the config is fixed" \
+expect "the bad rule was logged on the cwd events, once" \
+	"$(grep -c 'dir-blocks: config.json: rules\[3\] (relative/path)' "$STENCIL_LOG_DIR/tern.log")" 1
+expect "plugin list is still ready with the bad config" \
 	"$(tern plugin list --json | jq -r '.plugins[] | select(.id == "dir-blocks") | .status | if type == "string" then . else "failed" end')" ready
+config_json "" >"$TERN_CONFIG_DIR/plugin-data/dir-blocks/config.json"
 
 echo "== both blocks on the right (of: previous): the second block splits the first, not the shell"
 config_json ",
@@ -243,5 +239,6 @@ top=""
 echo "== windows"
 expect "Tern windows (hyprctl clients) unchanged" "$(tern_windows)" "$windows_before"
 expect "windows on the private daemon unchanged" "$(tern inspect --json | jq '[.clients[] | select(.kind == "window")] | length')" "$clients_before"
+expect "no plugin load-budget warning in the log" "$(grep -c 'exceeded' "$STENCIL_LOG_DIR/tern.log")" 0
 
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL: $fails check(s)"; echo "--- window log ---"; tail -30 "$tmp/window.log"; exit 1; fi
