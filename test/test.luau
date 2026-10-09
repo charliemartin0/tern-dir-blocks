@@ -140,7 +140,7 @@ local function new_world(opts)
 	opts = opts or {}
 	local w = {
 		panes = {}, -- {pane, tab, kind, block, floating, cwd}
-		hosts = { { kind = "local", name = "here", panes = {} } },
+		hosts = { { id = 0, kind = "local", name = "here", panes = {} } },
 		types = opts.types or { "jira.issues", "graphite.inbox" },
 		calls = {}, -- split / new_tab records
 		closed = {}, -- pane ids passed to close
@@ -176,6 +176,9 @@ local function new_world(opts)
 	cx.hosts = {
 		list = function(_)
 			return w.hosts
+		end,
+		current = function(_)
+			return w.current or w.hosts[1]
 		end,
 	}
 	cx.session = {
@@ -1009,6 +1012,182 @@ do
 		eq("failing close: the other block still closes", plugin_panes(w), 1)
 		cwd(e, w, 1, HOME .. "/elsewhere")
 		eq("failing close: still owned on the next directory event", plugin_panes(w), 0)
+	end
+end
+
+----------------------------------------------------------------------------------------------------
+-- host rules: opt-in rules for panes on a remote host
+----------------------------------------------------------------------------------------------------
+do
+	local SB = "/home/charlie/Dev/StoreboostServices"
+
+	-- config
+	local hc = config.parse({
+		rules = {
+			{ path = SB, host = " desktop-wsl ", blocks = { "jira" } },
+			{ path = SB, blocks = { "graphite" } },
+			{ path = "~/x", host = "desktop-wsl", blocks = { "jira" } },
+			{ path = "/y", host = "", blocks = { "jira" } },
+			{ path = "/z", host = 5, blocks = { "jira" } },
+			{ path = SB .. "/", host = "DESKTOP-WSL", blocks = { "jira" } },
+			{ path = "relative", host = "desktop-wsl", blocks = { "jira" } },
+		},
+	}, HOME)
+	eq("host rule and local rule with the same path both survive", #hc.rules, 2)
+	eq("host is trimmed", hc.rules[1].host, "desktop-wsl")
+	eq("host rule path is used as is", hc.rules[1].path, SB)
+	eq("host rule id carries the host", hc.rules[1].id, "desktop-wsl:" .. SB)
+	eq("local rule has no host", hc.rules[2].host, nil)
+	eq("local rule id is its path", hc.rules[2].id, SB)
+	local hp = joined(hc.problems)
+	check("host rule with ~ refused", string.find(hp, "needs an absolute path", 1, true) ~= nil, hp)
+	check("empty or non-string host refused", select(2, string.gsub(hp, "`host` must be a non%-empty string", "")) == 2, hp)
+	check("same host (any case) and path reported", string.find(hp, "same path as rules[1]", 1, true) ~= nil, hp)
+	check("relative host path refused", string.find(hp, "(desktop-wsl:relative): `path` must be absolute", 1, true) ~= nil, hp)
+	eq("five host-rule problems", #hc.problems, 5)
+
+	check("host matches name, any case", config.host_matches("Desktop-WSL", "desktop-wsl", nil))
+	check("host matches exact address", config.host_matches("charlie@desktop-wsl", "pc", "charlie@desktop-wsl"))
+	check("host matches address without user", config.host_matches("desktop-wsl", "pc", "charlie@desktop-wsl"))
+	check("host matches address without user and port", config.host_matches("100.119.193.109", "pc", "charlie@100.119.193.109:22"))
+	check("host does not match another host", not config.host_matches("desktop-wsl", "laptop", "charlie@laptop"))
+	check("host does not match a prefix", not config.host_matches("desktop", "desktop-wsl", "charlie@desktop-wsl"))
+	eq("best skips rules accept refuses", config.best(hc.rules, SB, function(r) return r.host == nil end).id, SB)
+
+	-- engine
+	local function remote_world(name, address)
+		local w = new_world()
+		w:add_pane({ pane = 1, tab = 10, kind = "terminal", cwd = HOME })
+		local far = { id = 1, kind = "remote", name = name or "desktop-wsl", address = address, panes = {} }
+		table.insert(w.hosts, far)
+		function w:add_remote(p)
+			table.insert(self.panes, p)
+			table.insert(far.panes, p.pane)
+			if not self.trees[p.tab] then
+				self.trees[p.tab] = { pane = p.pane }
+			end
+		end
+		w:add_remote({ pane = 20, tab = 30, kind = "terminal", cwd = "/home/charlie" })
+		w.current = far
+		w.focus = 20
+		-- blocks split from a remote pane belong to the remote host
+		local split = w.cx.layout.split
+		w.cx.layout.split = function(self, target, dir, launch, reveal)
+			local id = split(self, target, dir, launch, reveal)
+			if id and target >= 20 then
+				local hosts1 = w.hosts[1].panes
+				table.remove(hosts1, table.find(hosts1, id))
+				table.insert(far.panes, id)
+			end
+			return id
+		end
+		return w, far
+	end
+	local HOSTED = {
+		rules = {
+			{
+				path = SB,
+				host = "desktop-wsl",
+				blocks = { { block = "jira", place = "right" }, { block = "graphite", place = "down", of = "previous" } },
+			},
+		},
+	}
+
+	do
+		local w = remote_world()
+		local e = new_engine(HOSTED)
+		cwd(e, w, 20, "/home/charlie")
+		eq("remote pane outside the host rule opens nothing", #w.calls, 0)
+		cwd(e, w, 20, SB)
+		eq("remote pane entering a host rule opens its blocks", opened(w), "right:jira.issues,down:graphite.inbox")
+		eq("host rule splits the remote shell", w.calls[1].target, 20)
+		eq("host rule block gets the remote directory", w.calls[1].launch.cwd, SB)
+		eq("of previous stacks on the remote block", w.calls[2].target, 101)
+		cwd(e, w, 20, SB .. "/src")
+		cwd(e, w, 20, "/home/charlie")
+		cwd(e, w, 20, SB)
+		eq("host rule opens once per tab", #w.calls, 2)
+		cwd(e, w, 1, SB)
+		eq("a local pane at the same path ignores the host rule", #w.calls, 2)
+	end
+
+	do
+		local w = remote_world("other-box", "charlie@other-box")
+		local e = new_engine(HOSTED)
+		cwd(e, w, 20, SB)
+		eq("a pane on another remote host ignores the host rule", #w.calls, 0)
+	end
+
+	do
+		local w = remote_world("pc", "charlie@desktop-wsl")
+		local e = new_engine(HOSTED)
+		cwd(e, w, 20, SB)
+		eq("host rule matches the host by address", #w.calls, 2)
+	end
+
+	do
+		-- local rules unaffected; specificity only among rules for the pane's host
+		local w = remote_world()
+		local e = new_engine({
+			rules = {
+				{ path = "/home/charlie/Dev", blocks = { "jira" } },
+				{ path = SB, host = "desktop-wsl", blocks = { "graphite" } },
+			},
+		})
+		cwd(e, w, 20, "/home/charlie/Dev")
+		eq("a local rule never fires for a remote pane", #w.calls, 0)
+		cwd(e, w, 20, SB .. "/api")
+		eq("remote pane gets its host's rule", opened(w), "right:graphite.inbox")
+		w.current = w.hosts[1]
+		cwd(e, w, 1, SB)
+		eq("local pane gets the local rule, not the more specific host rule", opened(w), "right:graphite.inbox,right:jira.issues")
+		eq("local rule splits the local shell", w.calls[2].target, 1)
+	end
+
+	do
+		-- the window shows another host: wait for the next cd while that host is shown
+		local w = remote_world()
+		local e, h = new_engine(HOSTED)
+		w.current = w.hosts[1]
+		cwd(e, w, 20, SB)
+		eq("host rule waits while the window shows another host", #w.calls, 0)
+		check("waiting is logged", string.find(joined(h.logs.info), "window shows another host", 1, true) ~= nil)
+		w.current = w.hosts[2]
+		cwd(e, w, 20, SB .. "/src")
+		eq("host rule opens once its host is shown", #w.calls, 2)
+	end
+
+	do
+		-- manual command on a remote pane
+		local w = remote_world()
+		w.panes[2].cwd = SB
+		local e = new_engine(HOSTED)
+		e:open_now(w.cx)
+		eq("manual open uses the host rule", opened(w), "right:jira.issues,down:graphite.inbox")
+		eq("manual open toast names the host rule", w.toasts[#w.toasts].text, "dir-blocks: desktop-wsl:" .. SB)
+		local w2 = remote_world()
+		w2.panes[2].cwd = SB
+		local e2 = new_engine({ rules = { { path = SB, blocks = { "jira" } } } })
+		e2:open_now(w2.cx)
+		eq("manual open: a local rule does not apply to a remote pane", #w2.calls, 0)
+		eq("manual open says which host", w2.toasts[#w2.toasts].text, "dir-blocks: no rule matches " .. SB .. " on desktop-wsl")
+	end
+
+	do
+		-- close_on_leave with a host rule
+		local w = remote_world()
+		local cfg = { close_on_leave = true, rules = HOSTED.rules }
+		local e = new_engine(cfg)
+		cwd(e, w, 20, SB)
+		eq("close_on_leave host rule: opened", #w.calls, 2)
+		cwd(e, w, 1, "/elsewhere")
+		eq("close_on_leave: a local pane leaving does not close host-rule blocks", #w.closed, 0)
+		cwd(e, w, 20, SB .. "/deeper")
+		eq("close_on_leave: moving deeper keeps them", #w.closed, 0)
+		cwd(e, w, 20, "/home/charlie")
+		eq("close_on_leave: the remote shell leaving closes both", #w.closed, 2)
+		cwd(e, w, 20, SB)
+		eq("close_on_leave: re-entering reopens", #w.calls, 4)
 	end
 end
 

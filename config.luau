@@ -6,7 +6,9 @@ local M = {}
 export type Place = "right" | "down" | "tab"
 export type Of = "shell" | "previous"
 export type Entry = { block: string, place: Place, ratio: number, of: Of }
-export type Rule = { index: number, path: string, blocks: { Entry } }
+-- `host` is nil for a rule about this machine's panes; otherwise the remote host whose panes it matches.
+-- `id` keys the rule's per-tab memory: the path for a local rule, `<host>:<path>` (host lowercased) otherwise.
+export type Rule = { index: number, path: string, host: string?, id: string, blocks: { Entry } }
 export type Config = {
 	auto_open: boolean,
 	close_on_leave: boolean,
@@ -38,7 +40,7 @@ M.DEFAULT_TEXT = [[{
 
 local TOP_KEYS =
 	{ auto_open = true, close_on_leave = true, max_opens_per_minute = true, max_blocks_per_tab = true, rules = true }
-local RULE_KEYS = { path = true, blocks = true }
+local RULE_KEYS = { path = true, host = true, blocks = true }
 local ENTRY_KEYS = { block = true, place = true, ratio = true, of = true }
 
 --- Collapses `//`, `.` and `..` and drops a trailing slash. nil unless `path` is absolute.
@@ -79,19 +81,43 @@ function M.contains(root: string, path: string): boolean
 	return path == root or string.sub(path, 1, #root + 1) == root .. "/"
 end
 
---- The most specific (longest path) rule containing `path`; nil when none.
-function M.best(rules: { Rule }, path: string): Rule?
+--- The most specific (longest path) rule containing `path`; nil when none. With `accept`, only rules it
+--- returns true for compete (the engine passes "applies to this pane's host"), so a local rule never
+--- shadows a host rule or the other way round.
+function M.best(rules: { Rule }, path: string, accept: ((Rule) -> boolean)?): Rule?
 	local norm = M.normalize(path)
 	if norm == nil then
 		return nil
 	end
 	local found: Rule? = nil
 	for _, rule in rules do
-		if M.contains(rule.path, norm) and (found == nil or #rule.path > #found.path) then
+		if
+			(accept == nil or accept(rule))
+			and M.contains(rule.path, norm)
+			and (found == nil or #rule.path > #found.path)
+		then
 			found = rule
 		end
 	end
 	return found
+end
+
+--- Whether a rule's `host` names a host: its name (case-insensitive), its exact address, or the address
+--- without `user@` and `:port` (case-insensitive), so `charlie@desktop-wsl` matches `"desktop-wsl"`.
+function M.host_matches(spec: string, name: string?, address: string?): boolean
+	local want = string.lower(spec)
+	if name ~= nil and string.lower(name) == want then
+		return true
+	end
+	if address == nil or address == "" then
+		return false
+	end
+	if address == spec then
+		return true
+	end
+	local bare = string.match(address, "^[^@]*@(.*)$") or address
+	bare = string.match(bare, "^(.-):%d+$") or bare
+	return string.lower(bare) == want
 end
 
 local function is_array(t: any): boolean
@@ -189,8 +215,22 @@ local function parse_rule(raw: any, index: number, home: string?, problems: { st
 		table.insert(problems, label .. ": `path` must be a non-empty string")
 		return nil
 	end
-	label = label .. " (" .. raw.path .. ")"
-	local expanded = M.expand(raw.path, home)
+	local host: string? = nil
+	if raw.host ~= nil then
+		local trimmed = if type(raw.host) == "string" then string.match(raw.host, "^%s*(.-)%s*$") else nil
+		if trimmed == nil or trimmed == "" then
+			table.insert(problems, label .. ": `host` must be a non-empty string (a host name or address)")
+			return nil
+		end
+		host = trimmed
+	end
+	label = label .. " (" .. (if host then host .. ":" else "") .. raw.path .. ")"
+	-- `~` is this machine's home; a remote host's home is unknown here, so host rules take absolute paths.
+	if host ~= nil and string.sub(raw.path, 1, 1) == "~" then
+		table.insert(problems, label .. ": a `host` rule needs an absolute path (`~` only expands for this machine)")
+		return nil
+	end
+	local expanded = if host ~= nil then raw.path else M.expand(raw.path, home)
 	if expanded == nil then
 		table.insert(problems, label .. ": cannot expand `~` here; use `~/…` or an absolute path")
 		return nil
@@ -226,7 +266,8 @@ local function parse_rule(raw: any, index: number, home: string?, problems: { st
 	if #blocks == 0 then
 		return nil
 	end
-	return { index = index, path = path, blocks = blocks }
+	local id = if host ~= nil then string.lower(host) .. ":" .. path else path
+	return { index = index, path = path, host = host, id = id, blocks = blocks }
 end
 
 --- Validates a decoded config. Never raises; bad parts are skipped and reported in `problems`.
@@ -278,14 +319,14 @@ function M.parse(data: any, home: string?): Config
 				end
 				local rule = parse_rule(raw, i, home, problems)
 				if rule then
-					local first = seen[rule.path]
+					local first = seen[rule.id]
 					if first then
 						table.insert(
 							problems,
-							"rules[" .. i .. "] (" .. rule.path .. "): same path as rules[" .. first .. "]; ignored"
+							"rules[" .. i .. "] (" .. rule.id .. "): same path as rules[" .. first .. "]; ignored"
 						)
 					else
-						seen[rule.path] = i
+						seen[rule.id] = i
 						table.insert(cfg.rules, rule)
 					end
 				end
