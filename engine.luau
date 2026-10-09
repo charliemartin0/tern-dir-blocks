@@ -5,7 +5,8 @@
 -- drives it with a fake window.
 --
 -- Invariants:
---   * only blocks listed by the single most specific matching rule are opened;
+--   * only blocks listed by the single most specific matching rule are opened; a rule without `host`
+--     only matches panes on this machine, a rule with `host` only panes on that host;
 --   * each (tab, rule, block) is opened at most once until close_on_leave forgets it,
 --     and never when that block is already in the tab;
 --   * at most `max_blocks_per_tab` opens per tab and `max_opens_per_minute`
@@ -33,11 +34,14 @@ export type Deps = {
 -- already-present entry's completion on leave, never closing someone else's block.
 type Owned = { pane: number?, kind: string, key: string }
 
+-- What one rule completed in a tab: its directory, its host (nil: this machine) and the entries.
+type OwnedRule = { path: string, host: string?, items: { Owned } }
+
 type TabState = {
 	done: { [string]: boolean },
 	opened: number,
-	-- Completed entries by rule path, in opening order. Only filled while `close_on_leave` is on.
-	owned: { [string]: { Owned } },
+	-- Completed entries by rule id, in opening order. Only filled while `close_on_leave` is on.
+	owned: { [string]: OwnedRule },
 }
 
 type Fields = {
@@ -122,7 +126,7 @@ local function prune_problems(self: Engine, cfg: config.Config)
 	local live: { [string]: boolean } = {}
 	for _, rule in cfg.rules do
 		for _, entry in rule.blocks do
-			live[rule.path .. "|" .. entry.block] = true
+			live[rule.id .. "|" .. entry.block] = true
 		end
 	end
 	local removed = false
@@ -217,15 +221,30 @@ local function is_shell(pane: PaneInfo): boolean
 	return pane.kind == "terminal" or pane.kind == "agent"
 end
 
-local function is_local(cx: WindowCx, pane: number): boolean
+-- The host a pane runs on; nil when no attached host lists it.
+local function host_of(cx: WindowCx, pane: number): ManagedHost?
 	for _, host in cx.hosts:list() do
 		for _, id in host.panes do
 			if id == pane then
-				return host.kind == "local"
+				return host
 			end
 		end
 	end
-	return false
+	return nil
+end
+
+-- Whether a rule with this `host` (nil: this machine) applies to panes on `host`. Paths are that host's.
+local function applies(rule_host: string?, host: ManagedHost): boolean
+	if rule_host == nil then
+		return host.kind == "local"
+	end
+	return config.host_matches(rule_host, host.name, host.address)
+end
+
+local function accept_for(host: ManagedHost): (config.Rule) -> boolean
+	return function(rule: config.Rule): boolean
+		return applies(rule.host, host)
+	end
 end
 
 -- The plugin block kind for a configured `block`: a full kind (`jira.issues`) or a plugin id (`jira`)
@@ -380,10 +399,13 @@ local function open_block(
 	return pane, nil
 end
 
-local function remember(state: TabState, path: string, owned: Owned)
-	local list = state.owned[path] or {}
-	state.owned[path] = list
-	table.insert(list, owned)
+local function remember(state: TabState, rule: config.Rule, owned: Owned)
+	local entry = state.owned[rule.id]
+	if entry == nil then
+		entry = { path = rule.path, host = rule.host, items = {} }
+		state.owned[rule.id] = entry
+	end
+	table.insert(entry.items, owned)
 end
 
 -- Opens the rule's blocks that are not done / visible yet, in order. `manual` skips the once-per-tab
@@ -403,7 +425,7 @@ local function apply(
 	-- The pane of the previous entry's block, for `of = "previous"`.
 	local prev_pane: number? = nil
 	for _, entry in rule.blocks do
-		local key = rule.path .. "|" .. entry.block
+		local key = rule.id .. "|" .. entry.block
 		if not manual and state.done[key] then
 			local done_kind = resolve(cx, entry.block)
 			prev_pane = if done_kind then pane_in_tab(cx, tab, done_kind) else nil
@@ -412,7 +434,7 @@ local function apply(
 		local kind, why = resolve(cx, entry.block)
 		if kind == nil then
 			prev_pane = nil
-			set_problem(self, key, "rule " .. rule.path .. ": " .. tostring(why))
+			set_problem(self, key, "rule " .. rule.id .. ": " .. tostring(why))
 			table.insert(out.failed, entry.block)
 			continue
 		end
@@ -420,7 +442,7 @@ local function apply(
 		if existing then
 			prev_pane = existing
 			if cfg.close_on_leave and not state.done[key] then
-				remember(state, rule.path, { pane = nil, kind = kind, key = key })
+				remember(state, rule, { pane = nil, kind = kind, key = key })
 			end
 			state.done[key] = true
 			set_problem(self, key, nil)
@@ -438,13 +460,13 @@ local function apply(
 			if prev_pane ~= nil and cx.session:tab_of(prev_pane) == tab then
 				target = prev_pane
 			else
-				log_once(self, "warn", "rule " .. rule.path .. ": the block before `" .. entry.block .. "` is not in the tab; splitting the shell instead")
+				log_once(self, "warn", "rule " .. rule.id .. ": the block before `" .. entry.block .. "` is not in the tab; splitting the shell instead")
 			end
 		end
 		local id, err = open_block(self, cx, entry, kind, target, tab, dir)
 		if id == nil then
 			prev_pane = nil
-			set_problem(self, key, "rule " .. rule.path .. ": could not open `" .. entry.block .. "`: " .. tostring(err))
+			set_problem(self, key, "rule " .. rule.id .. ": could not open `" .. entry.block .. "`: " .. tostring(err))
 			table.insert(out.failed, entry.block)
 			continue
 		end
@@ -454,11 +476,11 @@ local function apply(
 		state.done[key] = true
 		state.opened += 1
 		if cfg.close_on_leave then
-			remember(state, rule.path, { pane = id, kind = kind, key = key })
+			remember(state, rule, { pane = id, kind = kind, key = key })
 		end
 		table.insert(self.recent, self.deps.now())
 		table.insert(out.opened, entry.block)
-		self.deps.log.info("dir-blocks: opened " .. kind .. " " .. entry.place .. " in tab " .. tab .. " for " .. rule.path)
+		self.deps.log.info("dir-blocks: opened " .. kind .. " " .. entry.place .. " in tab " .. tab .. " for " .. rule.id)
 	end
 	return out
 end
@@ -469,25 +491,26 @@ local function all_done(self: Engine, rule: config.Rule, tab: number): boolean
 		return false
 	end
 	for _, entry in rule.blocks do
-		if not state.done[rule.path .. "|" .. entry.block] then
+		if not state.done[rule.id .. "|" .. entry.block] then
 			return false
 		end
 	end
 	return true
 end
 
--- Whether `pane` reacts to rules: a tiled terminal or agent on this machine. Blocks (including the ones
--- this plugin opens) and floating panes never do.
-local function is_trigger(cx: WindowCx, pane: PaneInfo): boolean
-	return is_shell(pane) and pane.floating ~= true and is_local(cx, pane.pane)
+-- Whether `pane` can react to rules: a tiled terminal or agent. Blocks (including the ones this plugin
+-- opens) and floating panes never do. Which rules it reacts to depends on its host (`applies`).
+local function is_trigger(pane: PaneInfo): boolean
+	return is_shell(pane) and pane.floating ~= true
 end
 
--- Whether a shell of `tab` other than `except` is still in `path` or below it.
-local function shell_remains(cx: WindowCx, tab: number, except: number, path: string): boolean
+-- Whether a shell of `tab` other than `except`, on a host the rule applies to, is still in its directory.
+local function shell_remains(cx: WindowCx, tab: number, except: number, owner: OwnedRule): boolean
 	for _, pane in cx.session:panes() do
-		if pane.tab == tab and pane.pane ~= except and is_trigger(cx, pane) then
+		if pane.tab == tab and pane.pane ~= except and is_trigger(pane) then
+			local host = host_of(cx, pane.pane)
 			local dir = config.normalize(pane.cwd or "")
-			if dir ~= nil and config.contains(path, dir) then
+			if host ~= nil and applies(owner.host, host) and dir ~= nil and config.contains(owner.path, dir) then
 				return true
 			end
 		end
@@ -497,11 +520,13 @@ end
 
 -- Closes what the rule at `path` opened in this tab and forgets it, so entering the directory again opens
 -- it again. A block the user already closed is just forgotten.
-local function close_owned(self: Engine, cx: WindowCx, state: TabState, path: string)
-	local list = state.owned[path]
-	if list == nil then
+local function close_owned(self: Engine, cx: WindowCx, state: TabState, id: string)
+	local owner = state.owned[id]
+	if owner == nil then
 		return
 	end
+	local path = owner.path
+	local list = owner.items
 	for i = #list, 1, -1 do
 		local owned = list[i]
 		local pane = owned.pane
@@ -525,34 +550,41 @@ local function close_owned(self: Engine, cx: WindowCx, state: TabState, path: st
 		table.remove(list, i)
 	end
 	if #list == 0 then
-		state.owned[path] = nil
+		state.owned[id] = nil
 	end
 end
 
 -- A pane of `tab` moved to `dir`: closes the blocks of every rule whose directory it is no longer in, unless
 -- another shell of the tab is still there. Moving into a deeper rule's directory leaves the outer rule's
 -- blocks open, since the pane is still inside the outer directory.
-local function close_left(self: Engine, cx: WindowCx, pane_id: number, tab: number, dir: string)
+local function close_left(self: Engine, cx: WindowCx, pane: PaneInfo, host: ManagedHost, tab: number, dir: string)
 	local state = self.tabs[tab]
 	if state == nil or next(state.owned) == nil then
 		return
 	end
-	local pane = cx.session:pane(pane_id)
-	if pane == nil or not is_trigger(cx, pane) then
-		return
-	end
-	local paths: { string } = {}
-	for path in state.owned do
-		if not config.contains(path, dir) then
-			table.insert(paths, path)
+	-- Only rules for this pane's host: its path means nothing to another host's rules.
+	local ids: { string } = {}
+	for id, owner in state.owned do
+		if applies(owner.host, host) and not config.contains(owner.path, dir) then
+			table.insert(ids, id)
 		end
 	end
-	table.sort(paths)
-	for _, path in paths do
-		if not shell_remains(cx, tab, pane_id, path) then
-			close_owned(self, cx, state, path)
+	table.sort(ids)
+	for _, id in ids do
+		local owner = state.owned[id]
+		if owner ~= nil and not shell_remains(cx, tab, pane.pane, owner) then
+			close_owned(self, cx, state, id)
 		end
 	end
+end
+
+-- Whether the window shows `host`: `block_types` lists the current host's blocks, and a host rule's
+-- blocks must exist on the pane's host, so a host rule waits until its host is the one shown.
+local function shows(cx: WindowCx, host: ManagedHost): boolean
+	local ok, current = pcall(function()
+		return cx.hosts:current()
+	end)
+	return ok and current ~= nil and current.id == host.id
 end
 
 local function on_cwd(self: Engine, ev: CwdEvent, cx: WindowCx)
@@ -565,7 +597,18 @@ local function on_cwd(self: Engine, ev: CwdEvent, cx: WindowCx)
 	if dir == nil then
 		return
 	end
-	local rule = config.best(cfg.rules, dir)
+	-- Only shells react: blocks this plugin opens (and any other block) never trigger more opens.
+	local pane = cx.session:pane(ev.pane)
+	if pane == nil or not is_trigger(pane) then
+		return
+	end
+	-- Rule paths are one host's: rules without `host` are this machine's (`~` is its home), rules with
+	-- `host` that host's. Only rules for the pane's host compete.
+	local host = host_of(cx, ev.pane)
+	if host == nil then
+		return
+	end
+	local rule = config.best(cfg.rules, dir, accept_for(host))
 	if rule == nil and not cfg.close_on_leave then
 		return
 	end
@@ -574,15 +617,13 @@ local function on_cwd(self: Engine, ev: CwdEvent, cx: WindowCx)
 		return
 	end
 	if cfg.close_on_leave then
-		close_left(self, cx, ev.pane, tab, dir)
+		close_left(self, cx, pane, host, tab, dir)
 	end
 	if rule == nil or all_done(self, rule, tab) then
 		return
 	end
-	-- Only shells react: blocks this plugin opens (and any other block) never trigger more opens.
-	-- `~` and the rule paths are this machine's; another host's panes have their own filesystem.
-	local pane = cx.session:pane(ev.pane)
-	if pane == nil or not is_trigger(cx, pane) then
+	if rule.host ~= nil and not shows(cx, host) then
+		log_once(self, "info", "rule " .. rule.id .. ": window shows another host; opening on the next cd there")
 		return
 	end
 	apply(self, cx, cfg, rule, ev.pane, tab, dir, false)
@@ -639,23 +680,25 @@ local function open_now(self: Engine, cx: WindowCx)
 		source = alt
 	end
 	local dir = config.normalize(source.cwd or "")
-	local rule = if dir then config.best(cfg.rules, dir) else nil
+	local host = host_of(cx, source.pane)
+	if host == nil then
+		cx:toast("info", "dir-blocks: this pane is on no attached host")
+		return
+	end
+	local rule = if dir then config.best(cfg.rules, dir, accept_for(host)) else nil
 	if dir == nil or rule == nil then
-		cx:toast("info", "dir-blocks: no rule matches " .. (source.cwd or "this directory"))
+		local where = if host.kind == "local" then "" else " on " .. host.name
+		cx:toast("info", "dir-blocks: no rule matches " .. (source.cwd or "this directory") .. where)
 		return
 	end
 	local tab = source.tab or cx.session:tab_of(source.pane)
 	if tab == nil then
 		return
 	end
-	if not is_local(cx, source.pane) then
-		cx:toast("info", "dir-blocks: rules only apply to panes on this machine")
-		return
-	end
 	local out = apply(self, cx, cfg, rule, source.pane, tab, dir, true)
 	local text = summarize(out)
 	local level: ToastLevel = if #out.failed > 0 or out.limited then "error" else if #out.opened > 0 then "success" else "info"
-	cx:toast(level, "dir-blocks: " .. rule.path, text)
+	cx:toast(level, "dir-blocks: " .. rule.id, text)
 end
 
 --- "Open blocks for this directory now" command. Never raises.
